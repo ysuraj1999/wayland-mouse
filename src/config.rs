@@ -38,6 +38,10 @@ pub struct Settings {
     pub attack: f64,
     pub release: f64,
     pub reset_gap: Duration,
+    /// Emit acceleration as extra whole-detent notches (each its own SYN frame)
+    /// instead of one inflated hi-res delta, so apps that scroll a fixed amount
+    /// per wheel event (Flutter/Electron, e.g. the Ubuntu App Center) honor it.
+    pub wheel_discrete_steps: bool,
 
     // pointer acceleration (macOS-like logistic S-curve)
     pub pointer_accel: bool,
@@ -68,6 +72,7 @@ fn mac_like() -> Settings {
         attack: 0.6,
         release: 0.15,
         reset_gap: Duration::from_millis(180),
+        wheel_discrete_steps: true,
 
         pointer_accel: true,
         ptr_base: 0.5,
@@ -93,6 +98,7 @@ fn subtle() -> Settings {
         attack: 0.5,
         release: 0.15,
         reset_gap: Duration::from_millis(180),
+        wheel_discrete_steps: true,
 
         pointer_accel: true,
         ptr_base: 0.8,
@@ -117,6 +123,7 @@ fn off() -> Settings {
         attack: 1.0,
         release: 1.0,
         reset_gap: Duration::from_millis(180),
+        wheel_discrete_steps: false,
 
         pointer_accel: false,
         ptr_base: 1.0,
@@ -219,6 +226,8 @@ pub struct WheelCfg {
     pub smoothing_down: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_after_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discrete_steps: Option<bool>,
 }
 
 impl WheelCfg {
@@ -231,6 +240,7 @@ impl WheelCfg {
             && self.smoothing_up.is_none()
             && self.smoothing_down.is_none()
             && self.reset_after_ms.is_none()
+            && self.discrete_steps.is_none()
     }
 }
 
@@ -368,6 +378,9 @@ fn apply_wheel(s: &mut Settings, w: &WheelCfg) {
     if let Some(v) = w.reset_after_ms {
         s.reset_gap = Duration::from_secs_f64((v / 1000.0).max(0.0));
     }
+    if let Some(v) = w.discrete_steps {
+        s.wheel_discrete_steps = v;
+    }
 }
 
 fn apply_pointer(s: &mut Settings, p: &PointerCfg) {
@@ -464,7 +477,7 @@ fn print_settings(label: &str, s: &Settings) {
     println!("[{label}]  dpi = {}", s.dpi);
     println!(
         "  wheel:   enabled={} start_speed={} strength={} curve={} max_multiplier={} \
-         smoothing_up={} smoothing_down={} reset_after_ms={:.0}",
+         smoothing_up={} smoothing_down={} reset_after_ms={:.0} discrete_steps={}",
         s.wheel_enabled,
         s.threshold_dps,
         s.accel,
@@ -473,6 +486,7 @@ fn print_settings(label: &str, s: &Settings) {
         s.attack,
         s.release,
         s.reset_gap.as_secs_f64() * 1000.0,
+        s.wheel_discrete_steps,
     );
     println!(
         "  pointer: enabled={} precision_gain={:.3} max_gain={:.3} midpoint_speed={:.0} \
@@ -548,6 +562,7 @@ pub fn check(path: &Path) -> i32 {
         "smoothing_up",
         "smoothing_down",
         "reset_after_ms",
+        "discrete_steps",
     ];
     const POINTER: &[&str] = &[
         "enabled",
@@ -680,6 +695,7 @@ mod tests {
     fn default_is_mac_like() {
         let s = ConfigFile::default().resolve_global();
         assert!(s.wheel_enabled && s.pointer_accel);
+        assert!(s.wheel_discrete_steps); // on by default so App Center-class apps accelerate
         assert!(approx(s.threshold_dps, 5.0));
         assert!(approx(s.accel, 0.10));
         assert!(approx(s.max_mult, 8.0));

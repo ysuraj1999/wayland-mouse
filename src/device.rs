@@ -195,6 +195,7 @@ fn run_device(
                             ev.value(),
                             ev.timestamp(),
                             REL_WHEEL_HI,
+                            RelativeAxisType::REL_WHEEL,
                             &mut out,
                             'V',
                         );
@@ -209,6 +210,7 @@ fn run_device(
                             ev.value(),
                             ev.timestamp(),
                             REL_HWHEEL_HI,
+                            RelativeAxisType::REL_HWHEEL,
                             &mut out,
                             'H',
                         );
@@ -226,6 +228,7 @@ fn run_device(
                             ev.value() * 120,
                             ev.timestamp(),
                             REL_WHEEL_HI,
+                            RelativeAxisType::REL_WHEEL,
                             &mut out,
                             'V',
                         );
@@ -240,6 +243,7 @@ fn run_device(
                             ev.value() * 120,
                             ev.timestamp(),
                             REL_HWHEEL_HI,
+                            RelativeAxisType::REL_HWHEEL,
                             &mut out,
                             'H',
                         );
