@@ -63,12 +63,7 @@ fn syn() -> InputEvent {
 /// the same total distance either way. Each full detent carries the matching
 /// low-res `REL_WHEEL`/`REL_HWHEEL` tick too, mirroring real hi-res hardware. A
 /// sub-detent remainder is left unsynced; the caller's frame SYN closes it.
-fn emit_notches(
-    out: &mut Vec<InputEvent>,
-    hi: RelativeAxisType,
-    lo: RelativeAxisType,
-    outv: i32,
-) {
+fn emit_notches(out: &mut Vec<InputEvent>, hi: RelativeAxisType, lo: RelativeAxisType, outv: i32) {
     let step = HIRES_PER_DETENT as i32;
     let sign = if outv < 0 { -1 } else { 1 };
     let mut mag = outv.abs();
@@ -80,62 +75,6 @@ fn emit_notches(
     }
     if mag != 0 {
         out.push(InputEvent::new(EventType::RELATIVE.0, hi.0, sign * mag));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HI: RelativeAxisType = RelativeAxisType(0x0b); // REL_WHEEL_HI_RES
-    const LO: RelativeAxisType = RelativeAxisType(0x08); // REL_WHEEL
-
-    fn split(outv: i32) -> Vec<InputEvent> {
-        let mut out = Vec::new();
-        emit_notches(&mut out, HI, LO, outv);
-        out
-    }
-
-    // The emitted hi-res deltas must sum back to exactly the accelerated value,
-    // so a magnitude-summing app (Chrome/Firefox) scrolls the same distance.
-    #[test]
-    fn notches_preserve_total_magnitude() {
-        for outv in [-909, -840, -120, -69, 1, 120, 245, 960] {
-            let sum: i32 = split(outv)
-                .iter()
-                .filter(|e| e.event_type().0 == EventType::RELATIVE.0 && e.code() == HI.0)
-                .map(|e| e.value())
-                .sum();
-            assert_eq!(sum, outv, "hi-res sum mismatch for outv={outv}");
-        }
-    }
-
-    // One SYN frame + one low-res tick per whole detent, so a fixed-step app
-    // (Flutter/Electron) sees |outv|/120 discrete scroll events.
-    #[test]
-    fn notches_emit_one_frame_per_detent() {
-        let out = split(-909); // 7 full detents (840) + 69 remainder
-        let syns = out
-            .iter()
-            .filter(|e| e.event_type().0 == EventType::SYNCHRONIZATION.0)
-            .count();
-        let ticks: i32 = out
-            .iter()
-            .filter(|e| e.event_type().0 == EventType::RELATIVE.0 && e.code() == LO.0)
-            .map(|e| e.value())
-            .sum();
-        assert_eq!(syns, 7);
-        assert_eq!(ticks, -7); // signed like the scroll direction
-    }
-
-    // A pure sub-detent delta carries no SYN of its own (the caller's frame SYN
-    // closes it) and no low-res tick.
-    #[test]
-    fn sub_detent_remainder_has_no_frame() {
-        let out = split(-69);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].code(), HI.0);
-        assert_eq!(out[0].value(), -69);
     }
 }
 
@@ -199,5 +138,61 @@ pub fn scroll(
         emit_notches(out, out_code, lo_code, outv);
     } else {
         out.push(InputEvent::new(EventType::RELATIVE.0, out_code.0, outv));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HI: RelativeAxisType = RelativeAxisType(0x0b); // REL_WHEEL_HI_RES
+    const LO: RelativeAxisType = RelativeAxisType(0x08); // REL_WHEEL
+
+    fn split(outv: i32) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        emit_notches(&mut out, HI, LO, outv);
+        out
+    }
+
+    // The emitted hi-res deltas must sum back to exactly the accelerated value,
+    // so a magnitude-summing app (Chrome/Firefox) scrolls the same distance.
+    #[test]
+    fn notches_preserve_total_magnitude() {
+        for outv in [-909, -840, -120, -69, 1, 120, 245, 960] {
+            let sum: i32 = split(outv)
+                .iter()
+                .filter(|e| e.event_type().0 == EventType::RELATIVE.0 && e.code() == HI.0)
+                .map(|e| e.value())
+                .sum();
+            assert_eq!(sum, outv, "hi-res sum mismatch for outv={outv}");
+        }
+    }
+
+    // One SYN frame + one low-res tick per whole detent, so a fixed-step app
+    // (Flutter/Electron) sees |outv|/120 discrete scroll events.
+    #[test]
+    fn notches_emit_one_frame_per_detent() {
+        let out = split(-909); // 7 full detents (840) + 69 remainder
+        let syns = out
+            .iter()
+            .filter(|e| e.event_type().0 == EventType::SYNCHRONIZATION.0)
+            .count();
+        let ticks: i32 = out
+            .iter()
+            .filter(|e| e.event_type().0 == EventType::RELATIVE.0 && e.code() == LO.0)
+            .map(|e| e.value())
+            .sum();
+        assert_eq!(syns, 7);
+        assert_eq!(ticks, -7); // signed like the scroll direction
+    }
+
+    // A pure sub-detent delta carries no SYN of its own (the caller's frame SYN
+    // closes it) and no low-res tick.
+    #[test]
+    fn sub_detent_remainder_has_no_frame() {
+        let out = split(-69);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code(), HI.0);
+        assert_eq!(out[0].value(), -69);
     }
 }

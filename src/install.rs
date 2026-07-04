@@ -152,7 +152,11 @@ fn newer_user_binary(own_ver: &str) -> Option<(String, String)> {
         return None;
     }
     // If we *are* that binary, there's nothing newer to point to.
-    if std::env::current_exe().ok().and_then(|e| e.canonicalize().ok()) == cand.canonicalize().ok() {
+    if std::env::current_exe()
+        .ok()
+        .and_then(|e| e.canonicalize().ok())
+        == cand.canonicalize().ok()
+    {
         return None;
     }
     let out = Command::new(&path).arg("--version").output().ok()?;
@@ -172,7 +176,7 @@ fn semver_gt(a: &str, b: &str) -> bool {
         let mut it = s
             .trim()
             .trim_start_matches('v')
-            .split(|c: char| c == '.' || c == '-' || c == '+')
+            .split(['.', '-', '+'])
             .map(|f| f.parse().unwrap_or(0));
         (
             it.next().unwrap_or(0),
