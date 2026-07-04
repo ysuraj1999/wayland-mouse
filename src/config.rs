@@ -2,7 +2,7 @@
 //! overrides → DPI rescale) deserialized with serde, resolved into a flat
 //! [`Settings`] the hot path uses.
 //!
-//! The file format is human-friendly (`[wheel] max_multiplier = 8.0`); the
+//! The file format is human-friendly (`[wheel] max_multiplier = 6.0`); the
 //! runtime struct keeps the original mathematical field names. One serde type
 //! tree is the single source of truth a future GUI can round-trip.
 
@@ -66,9 +66,9 @@ fn mac_like() -> Settings {
     Settings {
         wheel_enabled: true,
         threshold_dps: 5.0,
-        accel: 0.10,
+        accel: 0.06,
         exponent: 1.0,
-        max_mult: 8.0,
+        max_mult: 6.0,
         attack: 0.6,
         release: 0.15,
         reset_gap: Duration::from_millis(180),
@@ -697,8 +697,8 @@ mod tests {
         assert!(s.wheel_enabled && s.pointer_accel);
         assert!(s.wheel_discrete_steps); // on by default so App Center-class apps accelerate
         assert!(approx(s.threshold_dps, 5.0));
-        assert!(approx(s.accel, 0.10));
-        assert!(approx(s.max_mult, 8.0));
+        assert!(approx(s.accel, 0.06));
+        assert!(approx(s.max_mult, 6.0));
         // dpi == reference, so the curve is unscaled
         assert!(approx(s.ptr_base, 0.5));
         assert!(approx(s.ptr_max, 2.5));
