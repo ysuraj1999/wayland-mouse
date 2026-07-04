@@ -34,14 +34,14 @@ Requires a `uinput`-capable kernel (standard on Linux).
 
 ```
 cargo install wayland-mouse
-sudo wayland-mouse install
+sudo "$(command -v wayland-mouse)" install
 ```
+
+The `"$(command -v wayland-mouse)"` is important: `sudo`'s `secure_path` excludes `~/.cargo/bin`, so a bare `sudo wayland-mouse install` would run an older copy on root's `PATH` (or report `command not found`) instead of the one you just installed. The same command **upgrades** — re-run both lines. (The installer also refuses to downgrade itself if it notices a newer copy in your cargo bin.)
 
 Or download the static binary from the [releases page](https://github.com/monfa-red/wayland-mouse/releases) and run `sudo ./wayland-mouse install`.
 
 `install` copies the binary to `/usr/local/bin`, registers a systemd service, writes a default config to `/etc/wayland-mouse/config.toml`, ensures `uinput` loads at boot, and on GNOME sets the pointer acceleration profile to flat. Then run `sudo wayland-mouse tune`.
-
-> If `sudo` reports `command not found`, `~/.cargo/bin` is not on root's `PATH`; use `sudo "$(command -v wayland-mouse)" install`.
 
 ## Configuration
 

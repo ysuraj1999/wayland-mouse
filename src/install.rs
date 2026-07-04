@@ -103,6 +103,22 @@ pub fn install() -> i32 {
 
 fn install_binary() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("finding own path: {e}"))?;
+    let own_ver = env!("CARGO_PKG_VERSION");
+
+    // Guard the classic upgrade footgun: `cargo install` drops the new binary in
+    // ~/.cargo/bin, but `sudo wayland-mouse install` runs the OLD copy already on
+    // root's PATH (/usr/local/bin) because sudo's secure_path omits ~/.cargo/bin —
+    // silently reinstalling the old version. If the invoking user has a newer copy
+    // in their cargo bin, stop and point them at it rather than no-op the upgrade.
+    if let Some((path, ver)) = newer_user_binary(own_ver) {
+        return Err(format!(
+            "refusing to install the older v{own_ver} over the newer v{ver} you have at\n  \
+             {path}\n\
+             (sudo ran this copy because ~/.cargo/bin isn't on root's PATH).\n\
+             Re-run:  sudo {path} install"
+        ));
+    }
+
     let already_installed = exe
         .canonicalize()
         .ok()
@@ -110,14 +126,61 @@ fn install_binary() -> Result<(), String> {
         .map(|(a, b)| a == b)
         .unwrap_or(false);
     if already_installed {
-        println!("==> Binary already at {BIN_PATH} (running it directly)");
+        println!("==> Binary already at {BIN_PATH} (v{own_ver})");
         return Ok(());
     }
-    println!("==> Installing binary -> {BIN_PATH}");
+    println!("==> Installing binary (v{own_ver}) -> {BIN_PATH}");
     fs::copy(&exe, BIN_PATH).map_err(|e| format!("copying binary to {BIN_PATH}: {e}"))?;
     fs::set_permissions(BIN_PATH, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod {BIN_PATH}: {e}"))?;
     Ok(())
+}
+
+/// Under `sudo`, look for a `wayland-mouse` in the invoking user's cargo bin that
+/// is newer than `own_ver`. Returns `(path, "x.y.z")` if one is found — the sign
+/// that `sudo` grabbed a stale copy off root's PATH instead of the just-upgraded
+/// one. Best-effort: any uncertainty (no `SUDO_USER`, missing file, unparseable
+/// version, or it's us) yields `None` so a normal reinstall proceeds untouched.
+fn newer_user_binary(own_ver: &str) -> Option<(String, String)> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    let path = format!("/home/{user}/.cargo/bin/wayland-mouse");
+    let cand = Path::new(&path);
+    if !cand.exists() {
+        return None;
+    }
+    // If we *are* that binary, there's nothing newer to point to.
+    if std::env::current_exe().ok().and_then(|e| e.canonicalize().ok()) == cand.canonicalize().ok() {
+        return None;
+    }
+    let out = Command::new(&path).arg("--version").output().ok()?;
+    // `--version` prints e.g. "wayland-mouse 0.7.0"; take the last token.
+    let other_ver = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()?
+        .to_string();
+    semver_gt(&other_ver, own_ver).then_some((path, other_ver))
+}
+
+/// `true` if dotted version `a` is strictly greater than `b`, compared
+/// numerically field by field (missing fields count as 0). Non-numeric or
+/// pre-release suffixes are ignored — good enough to catch a real upgrade.
+fn semver_gt(a: &str, b: &str) -> bool {
+    fn parse(s: &str) -> (u32, u32, u32) {
+        let mut it = s
+            .trim()
+            .trim_start_matches('v')
+            .split(|c: char| c == '.' || c == '-' || c == '+')
+            .map(|f| f.parse().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    }
+    parse(a) > parse(b)
 }
 
 /// Write the config only if absent — never clobber a user's tuning.
@@ -201,4 +264,26 @@ pub fn status() -> i32 {
     println!();
     config::print_effective(Path::new(CONFIG_PATH));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::semver_gt;
+
+    #[test]
+    fn semver_gt_orders_versions() {
+        assert!(semver_gt("0.6.0", "0.5.2")); // the case that bit us
+        assert!(semver_gt("0.7.0", "0.6.1"));
+        assert!(semver_gt("1.0.0", "0.9.9"));
+        assert!(semver_gt("0.6.10", "0.6.9")); // numeric, not lexical
+        assert!(!semver_gt("0.6.0", "0.6.0")); // equal is not greater
+        assert!(!semver_gt("0.5.2", "0.6.0"));
+        assert!(semver_gt("0.6.1", "0.6")); // missing patch == 0
+    }
+
+    #[test]
+    fn semver_gt_tolerates_prefix_and_suffix() {
+        assert!(semver_gt("v0.6.1", "v0.6.0"));
+        assert!(semver_gt("0.7.0-rc1", "0.6.9")); // suffix ignored
+    }
 }
