@@ -35,6 +35,9 @@ pub struct Settings {
     pub accel: f64,
     pub exponent: f64,
     pub max_mult: f64,
+    /// Multiplier floor at slow speed. < 1.0 de-amplifies slow scrolling for
+    /// finer control in magnitude apps (Chrome/Firefox); 1.0 = no floor.
+    pub min_mult: f64,
     pub attack: f64,
     pub release: f64,
     pub reset_gap: Duration,
@@ -42,6 +45,9 @@ pub struct Settings {
     /// instead of one inflated hi-res delta, so apps that scroll a fixed amount
     /// per wheel event (Flutter/Electron, e.g. the Ubuntu App Center) honor it.
     pub wheel_discrete_steps: bool,
+    /// Only emit those notches once the multiplier reaches this; below it a
+    /// single fine hi-res event keeps smooth apps gliding. 1.0 = always notch.
+    pub step_start: f64,
 
     // pointer acceleration (macOS-like logistic S-curve)
     pub pointer_accel: bool,
@@ -69,10 +75,15 @@ fn mac_like() -> Settings {
         accel: 0.06,
         exponent: 1.0,
         max_mult: 6.0,
+        // Slow scroll runs a touch below 1:1 for finer control in magnitude apps
+        // (Chrome/Firefox); notches only kick in past 1.5× so those apps glide
+        // until a fast flick. Tuned by feel; see the wheel module for the math.
+        min_mult: 0.9,
         attack: 0.6,
         release: 0.15,
         reset_gap: Duration::from_millis(180),
         wheel_discrete_steps: true,
+        step_start: 1.5,
 
         pointer_accel: true,
         ptr_base: 0.5,
@@ -95,10 +106,12 @@ fn subtle() -> Settings {
         accel: 0.05,
         exponent: 1.0,
         max_mult: 4.0,
+        min_mult: 1.0,
         attack: 0.5,
         release: 0.15,
         reset_gap: Duration::from_millis(180),
         wheel_discrete_steps: true,
+        step_start: 1.0,
 
         pointer_accel: true,
         ptr_base: 0.8,
@@ -120,10 +133,12 @@ fn off() -> Settings {
         accel: 0.0,
         exponent: 1.0,
         max_mult: 1.0,
+        min_mult: 1.0,
         attack: 1.0,
         release: 1.0,
         reset_gap: Duration::from_millis(180),
         wheel_discrete_steps: false,
+        step_start: 1.0,
 
         pointer_accel: false,
         ptr_base: 1.0,
@@ -225,9 +240,13 @@ pub struct WheelCfg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smoothing_down: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_multiplier: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_after_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discrete_steps: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps_above: Option<f64>,
 }
 
 impl WheelCfg {
@@ -237,10 +256,12 @@ impl WheelCfg {
             && self.strength.is_none()
             && self.curve.is_none()
             && self.max_multiplier.is_none()
+            && self.min_multiplier.is_none()
             && self.smoothing_up.is_none()
             && self.smoothing_down.is_none()
             && self.reset_after_ms.is_none()
             && self.discrete_steps.is_none()
+            && self.steps_above.is_none()
     }
 }
 
@@ -369,6 +390,9 @@ fn apply_wheel(s: &mut Settings, w: &WheelCfg) {
     if let Some(v) = w.max_multiplier {
         s.max_mult = v;
     }
+    if let Some(v) = w.min_multiplier {
+        s.min_mult = v;
+    }
     if let Some(v) = w.smoothing_up {
         s.attack = v;
     }
@@ -380,6 +404,9 @@ fn apply_wheel(s: &mut Settings, w: &WheelCfg) {
     }
     if let Some(v) = w.discrete_steps {
         s.wheel_discrete_steps = v;
+    }
+    if let Some(v) = w.steps_above {
+        s.step_start = v;
     }
 }
 
@@ -477,16 +504,19 @@ fn print_settings(label: &str, s: &Settings) {
     println!("[{label}]  dpi = {}", s.dpi);
     println!(
         "  wheel:   enabled={} start_speed={} strength={} curve={} max_multiplier={} \
-         smoothing_up={} smoothing_down={} reset_after_ms={:.0} discrete_steps={}",
+         min_multiplier={} smoothing_up={} smoothing_down={} reset_after_ms={:.0} \
+         discrete_steps={} steps_above={}",
         s.wheel_enabled,
         s.threshold_dps,
         s.accel,
         s.exponent,
         s.max_mult,
+        s.min_mult,
         s.attack,
         s.release,
         s.reset_gap.as_secs_f64() * 1000.0,
         s.wheel_discrete_steps,
+        s.step_start,
     );
     println!(
         "  pointer: enabled={} precision_gain={:.3} max_gain={:.3} midpoint_speed={:.0} \
@@ -559,10 +589,12 @@ pub fn check(path: &Path) -> i32 {
         "strength",
         "curve",
         "max_multiplier",
+        "min_multiplier",
         "smoothing_up",
         "smoothing_down",
         "reset_after_ms",
         "discrete_steps",
+        "steps_above",
     ];
     const POINTER: &[&str] = &[
         "enabled",
@@ -661,6 +693,15 @@ fn validate_ranges(s: &Settings, warn: &mut impl FnMut(String)) {
     if s.max_mult < 1.0 {
         warn("wheel.max_multiplier should be >= 1.0".into());
     }
+    if s.min_mult <= 0.0 {
+        warn("wheel.min_multiplier should be > 0".into());
+    }
+    if s.min_mult > s.max_mult {
+        warn("wheel.min_multiplier is above max_multiplier (curve flattens to max)".into());
+    }
+    if s.step_start < 1.0 {
+        warn("wheel.steps_above should be >= 1.0".into());
+    }
     for (name, v) in [("smoothing_up", s.attack), ("smoothing_down", s.release)] {
         if v <= 0.0 || v > 1.0 {
             warn(format!("wheel.{name} should be in (0, 1] (got {v})"));
@@ -699,11 +740,27 @@ mod tests {
         assert!(approx(s.threshold_dps, 5.0));
         assert!(approx(s.accel, 0.06));
         assert!(approx(s.max_mult, 6.0));
+        // Slight slow-speed de-amp + notches only past 1.5× (tuned by feel).
+        assert!(approx(s.min_mult, 0.9));
+        assert!(approx(s.step_start, 1.5));
         // dpi == reference, so the curve is unscaled
         assert!(approx(s.ptr_base, 0.5));
         assert!(approx(s.ptr_max, 2.5));
         assert!(approx(s.ptr_mid, 4000.0));
         assert!(approx(s.dpi, 1400.0));
+    }
+
+    #[test]
+    fn wheel_min_and_step_overrides_apply() {
+        let cf: ConfigFile = toml::from_str(
+            "preset = \"mac-like\"\n[wheel]\nmin_multiplier = 0.8\nsteps_above = 2.0\n",
+        )
+        .unwrap();
+        let s = cf.resolve_global();
+        assert!(approx(s.min_mult, 0.8));
+        assert!(approx(s.step_start, 2.0));
+        // other wheel knobs still come from the preset
+        assert!(approx(s.max_mult, 6.0));
     }
 
     #[test]

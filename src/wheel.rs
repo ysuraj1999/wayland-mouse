@@ -41,10 +41,14 @@ impl Axis {
 
 fn mult_for_speed(c: &Settings, dps: f64) -> f64 {
     let over = dps - c.threshold_dps;
-    if over <= 0.0 {
-        return 1.0;
-    }
-    (1.0 + c.accel * over.powf(c.exponent)).min(c.max_mult)
+    // Floor at `min_mult` (set < 1.0 for finer slow-speed control in magnitude
+    // apps), growing to `max_mult`. min_mult = 1.0 reproduces the plain curve.
+    let grown = if over <= 0.0 {
+        c.min_mult
+    } else {
+        c.min_mult + c.accel * over.powf(c.exponent)
+    };
+    grown.min(c.max_mult)
 }
 
 /// EV_SYN / SYN_REPORT frame delimiter.
@@ -172,8 +176,13 @@ pub fn scroll(
     let outv = ax.carry.trunc() as i32;
     ax.carry -= outv as f64;
 
+    // Emit discrete notches only once acceleration reaches `step_start`; below
+    // that a single fine hi-res event keeps magnitude apps (Chrome/Firefox)
+    // gliding. `wheel_discrete_steps` is the master on/off for the whole trick.
+    let notched = c.wheel_discrete_steps && mult >= c.step_start;
+
     if c.debug {
-        let steps = if c.wheel_discrete_steps {
+        let steps = if notched {
             outv.abs() / HIRES_PER_DETENT as i32
         } else {
             0
@@ -186,7 +195,7 @@ pub fn scroll(
     if outv == 0 {
         return;
     }
-    if c.wheel_discrete_steps {
+    if notched {
         emit_notches(out, out_code, lo_code, outv);
     } else {
         out.push(InputEvent::new(EventType::RELATIVE.0, out_code.0, outv));

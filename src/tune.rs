@@ -127,7 +127,9 @@ enum Field {
     StartSpeed,
     Strength,
     Curve,
+    MinMult,
     MaxMult,
+    StepStart,
     SmoothUp,
     SmoothDown,
     ResetMs,
@@ -142,12 +144,14 @@ const PTR_FIELDS: [Field; 6] = [
     Field::Width,
     Field::PtrSmoothing,
 ];
-const WHEEL_FIELDS: [Field; 8] = [
+const WHEEL_FIELDS: [Field; 10] = [
     Field::WheelEnabled,
     Field::StartSpeed,
     Field::Strength,
     Field::Curve,
+    Field::MinMult,
     Field::MaxMult,
+    Field::StepStart,
     Field::SmoothUp,
     Field::SmoothDown,
     Field::ResetMs,
@@ -166,7 +170,9 @@ impl Field {
             Field::StartSpeed => "Start speed",
             Field::Strength => "Strength",
             Field::Curve => "Curve",
+            Field::MinMult => "Min multiplier",
             Field::MaxMult => "Max multiplier",
+            Field::StepStart => "Steps above",
             Field::SmoothUp => "Speed-up smooth",
             Field::SmoothDown => "Slow-down smooth",
             Field::ResetMs => "Reset pause",
@@ -188,7 +194,9 @@ impl Field {
             Field::StartSpeed => (0.0, 40.0),
             Field::Strength => (0.0, 1.0),
             Field::Curve => (0.5, 2.5),
+            Field::MinMult => (0.2, 2.0),
             Field::MaxMult => (1.0, 20.0),
+            Field::StepStart => (1.0, 10.0),
             Field::SmoothUp | Field::SmoothDown => (0.05, 1.0),
             Field::ResetMs => (40.0, 600.0),
             Field::Dpi => (200.0, 6400.0),
@@ -206,7 +214,9 @@ impl Field {
             Field::StartSpeed => 1.0,
             Field::Strength => 0.01,
             Field::Curve => 0.05,
+            Field::MinMult => 0.05,
             Field::MaxMult => 0.5,
+            Field::StepStart => 0.5,
             Field::SmoothUp | Field::SmoothDown => 0.05,
             Field::ResetMs => 10.0,
             Field::Dpi => 50.0,
@@ -220,9 +230,10 @@ impl Field {
             | Field::MaxGain
             | Field::Strength
             | Field::Curve
+            | Field::MinMult
             | Field::SmoothUp
             | Field::SmoothDown => 2,
-            Field::MaxMult => 1,
+            Field::MaxMult | Field::StepStart => 1,
             _ => 0,
         }
     }
@@ -233,7 +244,7 @@ impl Field {
             Field::StartSpeed => " det/s",
             Field::PtrSmoothing | Field::ResetMs => " ms",
             Field::MaxGain => "×",
-            Field::MaxMult => "×",
+            Field::MaxMult | Field::MinMult | Field::StepStart => "×",
             _ => "",
         }
     }
@@ -253,7 +264,9 @@ fn field_value(cfg: &ConfigFile, f: Field) -> f64 {
         Field::StartSpeed => s.threshold_dps,
         Field::Strength => s.accel,
         Field::Curve => s.exponent,
+        Field::MinMult => s.min_mult,
         Field::MaxMult => s.max_mult,
+        Field::StepStart => s.step_start,
         Field::SmoothUp => s.attack,
         Field::SmoothDown => s.release,
         Field::ResetMs => s.reset_gap.as_secs_f64() * 1000.0,
@@ -271,7 +284,9 @@ fn field_set(cfg: &mut ConfigFile, f: Field, v: f64) {
         Field::StartSpeed => cfg.wheel.start_speed = Some(v),
         Field::Strength => cfg.wheel.strength = Some(v),
         Field::Curve => cfg.wheel.curve = Some(v),
+        Field::MinMult => cfg.wheel.min_multiplier = Some(v),
         Field::MaxMult => cfg.wheel.max_multiplier = Some(v),
+        Field::StepStart => cfg.wheel.steps_above = Some(v),
         Field::SmoothUp => cfg.wheel.smoothing_up = Some(v),
         Field::SmoothDown => cfg.wheel.smoothing_down = Some(v),
         Field::ResetMs => cfg.wheel.reset_after_ms = Some(v),
@@ -323,11 +338,12 @@ fn pointer_gain(s: &Settings, v: f64) -> f64 {
 
 fn wheel_mult(s: &Settings, dps: f64) -> f64 {
     let over = dps - s.threshold_dps;
-    if over <= 0.0 {
-        1.0
+    let grown = if over <= 0.0 {
+        s.min_mult
     } else {
-        (1.0 + s.accel * over.powf(s.exponent)).min(s.max_mult)
-    }
+        s.min_mult + s.accel * over.powf(s.exponent)
+    };
+    grown.min(s.max_mult)
 }
 
 // ---------------------------------------------------------------------------

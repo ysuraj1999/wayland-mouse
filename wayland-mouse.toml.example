@@ -34,6 +34,8 @@ start_speed    = 5      # below this wheel speed, multiplier = 1.0 (slow scroll 
 strength       = 0.06   # how fast the multiplier grows past start_speed
 curve          = 1.0    # shape of (speed - start_speed); 1.0 = linear, >1 ramps up faster
 max_multiplier = 6.0    # cap on the wheel multiplier
+min_multiplier = 0.9    # multiplier at slow speed; lower it (e.g. 0.8) for finer
+#                       # slow-scroll control in magnitude apps (Chrome/Firefox)
 smoothing_up   = 0.6    # smoothing when speeding up (0..1, higher = snappier)
 smoothing_down = 0.15   # smoothing when slowing down (0..1, lower = no jitter)
 reset_after_ms = 180    # a pause longer than this resets to slow (fresh flick = 1.0x)
@@ -41,6 +43,9 @@ discrete_steps = true   # emit accel as extra wheel notches, not one larger delt
 #                       # apps that scroll a fixed amount per wheel event honor it
 #                       # (Flutter/Electron — e.g. the Ubuntu App Center). Smooth apps
 #                       # (Chrome/Firefox) scroll the same distance. Set false to disable.
+steps_above    = 1.5    # only start emitting those notches once the multiplier passes
+#                       # this — raise it to keep smooth apps gliding longer before
+#                       # fast flicks step. Only applies when discrete_steps = true.
 
 # =====================================================================
 # POINTER acceleration (macOS-like logistic S-curve)
