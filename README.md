@@ -7,7 +7,7 @@ Wayland has no scroll-wheel speed setting, only a coarse pointer-acceleration cu
 ## Features
 
 - **Pointer acceleration.** A logistic gain curve: 1:1 at low speed for precision, higher gain at high speed, with a ceiling. The `mac-like` preset approximates macOS.
-- **Wheel acceleration.** Unchanged when scrolling slowly; multiplied when scrolling fast, so long pages take one flick.
+- **Wheel acceleration.** Precise at low speed, multiplied when you scroll fast, so long pages take one flick — consistently across app toolkits (see [How it works](#how-it-works)).
 - **Button remapping.** Map any button to a key combination, e.g. the side buttons to workspace switch. Emitted as keystrokes, so it is independent of the compositor.
 - **Live tuning.** `wayland-mouse tune` plots each curve with a marker that follows the mouse; edits apply immediately.
 - **DPI- and polling-rate-independent.** Curves are derived from kernel event timestamps. Tested at 8000 Hz.
@@ -37,7 +37,7 @@ cargo install wayland-mouse
 sudo "$(command -v wayland-mouse)" install
 ```
 
-The `"$(command -v wayland-mouse)"` is important: `sudo`'s `secure_path` excludes `~/.cargo/bin`, so a bare `sudo wayland-mouse install` would run an older copy on root's `PATH` (or report `command not found`) instead of the one you just installed. The same command **upgrades** — re-run both lines. (The installer also refuses to downgrade itself if it notices a newer copy in your cargo bin.)
+The `$(command -v …)` matters: `sudo`'s `secure_path` skips `~/.cargo/bin`, so a bare `sudo wayland-mouse install` runs an older copy on root's `PATH` (or fails with `command not found`) instead of the one you just installed. Re-run both lines to **upgrade** — the installer refuses to reinstall an older binary over a newer one in your cargo bin.
 
 Or download the static binary from the [releases page](https://github.com/monfa-red/wayland-mouse/releases) and run `sudo ./wayland-mouse install`.
 
@@ -81,6 +81,8 @@ The compositor's own pointer acceleration must be disabled, or it stacks on top 
 ## How it works
 
 Each mouse is grabbed with evdev and re-emitted through a virtual `uinput` device with the curves applied. The grab is tied to the process, so if the daemon stops, the mouse returns to normal immediately. Pointer motion and unmapped buttons are copied through unmodified.
+
+Scroll acceleration reaches every app by working two ways at once. Apps that scroll by the raw wheel delta (Chrome, Firefox, GTK) get a larger delta; apps that scroll a fixed amount per notch and ignore the delta (Flutter, Electron — e.g. the Ubuntu App Center) get extra notches instead. Both cover the same distance, so the feel stays consistent across toolkits. Slow scrolling stays fine-grained, and the crossover between the two is tunable (`min_multiplier`, `steps_above`).
 
 ## License
 
