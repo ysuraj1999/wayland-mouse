@@ -1772,6 +1772,7 @@ dependencies = [
  "arc-swap",
  "clap",
  "evdev",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

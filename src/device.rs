@@ -3,10 +3,11 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // evdev 0.13 renamed Key -> KeyCode and RelativeAxisType -> RelativeAxisCode;
 // we alias them back to the old names to keep the code below unchanged.
@@ -16,11 +17,12 @@ use evdev::{
     RelativeAxisCode as RelativeAxisType,
 };
 
-use crate::ipc::Shared;
+use crate::clicklock::ClickLock;
+use crate::ipc::{DeviceInfo, Shared};
 use crate::pointer::{accel_pointer, Pointer};
 use crate::wheel::{scroll, Axis};
 
-/// Virtual-device name prefix for devices we create. `is_wheel_mouse` skips
+/// Virtual-device name prefix for devices we create. `is_target_mouse` skips
 /// anything carrying this so we never grab our own output.
 pub const VIRT_PREFIX: &str = "wayland-mouse";
 
@@ -30,15 +32,6 @@ const REL_HWHEEL_HI: RelativeAxisType = RelativeAxisType(0x0c);
 /// Daemon entry point: enumerate, grab new wheel mice, and watch for hotplug.
 pub fn run(shared: Arc<Shared>) {
     let handled: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-    let cfg = shared.current();
-
-    // The virtual keyboard for button remaps is created on demand (see
-    // Shared::ensure_keyboard), so users who never remap a button get no extra
-    // uinput device. Create it up front only when remaps are already configured,
-    // so the compositor recognises it before the first press.
-    if !cfg.button.is_empty() {
-        shared.ensure_keyboard();
-    }
 
     // Control socket for the live-tuning UI.
     {
@@ -46,24 +39,30 @@ pub fn run(shared: Arc<Shared>) {
         thread::spawn(move || crate::ipc::serve(shared));
     }
 
-    let name_filter = cfg.name_filter.clone();
-    eprintln!(
-        "wayland-mouse started (preset={}, name_filter={:?}, buttons={}, debug={})",
-        cfg.preset,
-        name_filter,
-        cfg.button.len(),
-        cfg.debug
-    );
-
     loop {
+        let cfg = shared.current();
+        let name_filter = cfg.name_filter.clone();
+        let mut snapshot = Vec::new();
+
         for (path, dev) in evdev::enumerate() {
+            let name = dev.name().unwrap_or("").to_string();
+            let grabbed = handled.lock().map(|s| s.contains(&path)).unwrap_or(false);
+            if !name.contains(VIRT_PREFIX) {
+                let info = device_info(&path, &dev, grabbed);
+                if info.has_wheel || info.has_pointer {
+                    snapshot.push(info);
+                }
+            }
+
             {
                 let s = handled.lock().unwrap();
                 if s.contains(&path) {
                     continue;
                 }
             }
-            if is_target_mouse(&dev, &name_filter) {
+            let click_lock = cfg.click_lock_for(&name);
+            let managed = cfg.rule_for(&name).is_some();
+            if is_target_mouse(&dev, &name_filter, click_lock, managed) {
                 drop(dev);
                 handled.lock().unwrap().insert(path.clone());
                 let shared = shared.clone();
@@ -79,31 +78,49 @@ pub fn run(shared: Arc<Shared>) {
                 });
             }
         }
+
+        shared.set_devices(snapshot);
         thread::sleep(Duration::from_secs(3));
     }
 }
 
-/// A device worth grabbing: a mouse with a wheel, **or** a mouse's sibling
-/// "extra buttons" node. Many mice expose two event devices — the wheel + main
-/// buttons on one, and BTN_SIDE/EXTRA/FORWARD/BACK on another — so we grab the
-/// second too, otherwise those side buttons can't be remapped or captured.
-/// (Only real mice advertise BTN_SIDE/EXTRA/FORWARD/BACK, so this won't grab a
-/// keyboard.)
-fn is_target_mouse(dev: &Device, filter: &str) -> bool {
+fn device_info(path: &Path, dev: &Device, grabbed: bool) -> DeviceInfo {
+    let axes = dev.supported_relative_axes();
+    let has_wheel =
+        axes.is_some_and(|s| s.contains(RelativeAxisType::REL_WHEEL) || s.contains(REL_WHEEL_HI));
+    let has_pointer = axes.is_some_and(|s| {
+        s.contains(RelativeAxisType::REL_X) && s.contains(RelativeAxisType::REL_Y)
+    });
+    let has_left = dev
+        .supported_keys()
+        .is_some_and(|k| k.contains(Key::BTN_LEFT));
+    DeviceInfo {
+        name: dev.name().unwrap_or("mouse").to_string(),
+        path: path.to_string_lossy().into_owned(),
+        grabbed,
+        has_wheel,
+        has_pointer,
+        has_left,
+    }
+}
+
+/// A device worth grabbing: a wheel mouse, or a pointer node that has click
+/// lock enabled for it (so a trackpad exposed as a plain mouse can use it too).
+fn is_target_mouse(dev: &Device, filter: &str, click_lock: bool, managed: bool) -> bool {
     let name = dev.name().unwrap_or("");
     if name.contains(VIRT_PREFIX) {
         return false;
     }
-    let has_wheel = dev
-        .supported_relative_axes()
-        .is_some_and(|s| s.contains(RelativeAxisType::REL_WHEEL) || s.contains(REL_WHEEL_HI));
-    let has_extra_buttons = dev.supported_keys().is_some_and(|k| {
-        k.contains(Key::BTN_SIDE)
-            || k.contains(Key::BTN_EXTRA)
-            || k.contains(Key::BTN_FORWARD)
-            || k.contains(Key::BTN_BACK)
+    let axes = dev.supported_relative_axes();
+    let has_wheel =
+        axes.is_some_and(|s| s.contains(RelativeAxisType::REL_WHEEL) || s.contains(REL_WHEEL_HI));
+    let has_pointer = axes.is_some_and(|s| {
+        s.contains(RelativeAxisType::REL_X) && s.contains(RelativeAxisType::REL_Y)
     });
-    if !has_wheel && !has_extra_buttons {
+    let has_left = dev
+        .supported_keys()
+        .is_some_and(|k| k.contains(Key::BTN_LEFT));
+    if !(has_wheel || ((click_lock || managed) && has_pointer && has_left)) {
         return false;
     }
     filter.is_empty() || name.to_lowercase().contains(&filter.to_lowercase())
@@ -119,10 +136,14 @@ fn run_device(
     // Resolve this device's effective settings; re-resolved live when the
     // config version changes (see the loop below).
     let mut settings = shared.current().resolve(&name);
+    let mut managed = shared.current().rule_for(&name).is_some();
     let mut version = shared.version();
     let has_hires = dev
         .supported_relative_axes()
         .is_some_and(|s| s.contains(REL_WHEEL_HI));
+    let has_wheel = dev
+        .supported_relative_axes()
+        .is_some_and(|s| s.contains(RelativeAxisType::REL_WHEEL) || s.contains(REL_WHEEL_HI));
 
     let mut axes = AttributeSet::<RelativeAxisType>::new();
     if let Some(s) = dev.supported_relative_axes() {
@@ -156,13 +177,14 @@ fn run_device(
 
     dev.grab()?;
     eprintln!(
-        "handling {path:?}  {name:?}  hi-res={has_hires}  wheel={}  pointer={}",
-        settings.wheel_enabled, settings.pointer_accel
+        "handling {path:?}  {name:?}  hi-res={has_hires}  wheel={}  pointer={}  click_lock={}",
+        settings.wheel_enabled, settings.pointer_accel, settings.click_lock
     );
 
     let mut vy = Axis::new();
     let mut hx = Axis::new();
     let mut ptr = Pointer::new();
+    let mut cl = ClickLock::from_settings(&settings);
     let mut fdx = 0i32; // accumulated frame motion
     let mut fdy = 0i32;
     let mut pa = settings.pointer_accel;
@@ -170,23 +192,69 @@ fn run_device(
     let mut out: Vec<InputEvent> = Vec::with_capacity(64);
 
     loop {
-        let events = match dev.fetch_events() {
-            Ok(e) => e,
-            Err(_) => break,
-        };
         // Pick up live config edits pushed by the tuner.
         let v = shared.version();
         if v != version {
             settings = shared.current().resolve(&name);
+            managed = shared.current().rule_for(&name).is_some();
             version = v;
             pa = settings.pointer_accel;
             we = settings.wheel_enabled;
+            if cl.apply(&settings) {
+                emit_left_release(&mut vdev)?;
+            }
         }
+
+        // A pointer-only node is grabbed solely for click lock or an explicit
+        // device rule; if neither applies, release it.
+        if !has_wheel && !settings.click_lock && !managed {
+            break;
+        }
+
+        let timeout = cl.next_timeout(Instant::now());
+        let ms = timeout
+            .map(|d| d.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(-1);
+        let mut pfd = libc::pollfd {
+            fd: dev.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if rc == 0 {
+            if cl.on_timeout(Instant::now()) {
+                emit_left_release(&mut vdev)?;
+            }
+            continue;
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            break;
+        }
+        if (pfd.revents & libc::POLLIN) == 0 {
+            continue;
+        }
+
+        let events = match dev.fetch_events() {
+            Ok(e) => e,
+            Err(_) => break,
+        };
         out.clear();
         for ev in events {
             let et = ev.event_type();
             if et == EventType::RELATIVE {
                 let code = ev.code();
+                if (code == RelativeAxisType::REL_X.0 || code == RelativeAxisType::REL_Y.0)
+                    && ev.value() != 0
+                {
+                    cl.on_motion(Instant::now());
+                }
                 if code == REL_WHEEL_HI.0 {
                     if we {
                         scroll(
@@ -264,26 +332,16 @@ fn run_device(
                     out.push(InputEvent::new(EventType::RELATIVE.0, code, ev.value()));
                 }
             } else if et == EventType::KEY {
-                // Remapped button: swallow it and emit the combo on the virtual
-                // keyboard. Unmapped buttons pass straight through. Either way,
-                // report the press so the tuner's capture flow can see it. The
-                // remap table is read live so tuner edits apply without restart.
                 let code = ev.code();
-                if ev.value() == 1 {
-                    shared.telemetry.set_button(code);
-                }
-                // Only touch the keyboard when this button is actually remapped,
-                // so unmapped clicks (and users with no remaps) pay nothing.
-                let remap = shared.remap();
-                match remap.get(code) {
-                    Some(action) => match shared.ensure_keyboard() {
-                        Some(kb) => kb.apply(action, ev.value()),
-                        None => out.push(InputEvent::new(et.0, code, ev.value())),
-                    },
-                    None => out.push(InputEvent::new(et.0, code, ev.value())),
+                if code == Key::BTN_LEFT.code() && cl.enabled() {
+                    if cl.on_left(ev.value(), Instant::now()) {
+                        out.push(InputEvent::new(et.0, code, ev.value()));
+                    }
+                } else {
+                    out.push(InputEvent::new(et.0, code, ev.value()));
                 }
             } else if et == EventType::SYNCHRONIZATION && ev.code() == 0 {
-                // SYN_REPORT: accelerate this frame's motion, then emit the SYN
+                // SYN_REPORT: accelerate this frame's motion, then emit the SYN.
                 if pa && (fdx != 0 || fdy != 0) {
                     accel_pointer(&settings, &mut ptr, fdx, fdy, ev.timestamp(), &mut out);
                     fdx = 0;
@@ -297,11 +355,17 @@ fn run_device(
         if !out.is_empty() && vdev.emit(&out).is_err() {
             break;
         }
+        if cl.on_timeout(Instant::now()) {
+            emit_left_release(&mut vdev)?;
+        }
         // Publish the latest measured speeds/gains for the tuner's live markers.
         shared.telemetry.set_pointer(ptr.speed(), ptr.gain());
         shared.telemetry.set_wheel(vy.dps(), vy.mult());
     }
 
+    if cl.is_locked() {
+        let _ = emit_left_release(&mut vdev);
+    }
     let _ = dev.ungrab();
     if let Ok(mut s) = handled.lock() {
         s.remove(&path);
@@ -310,51 +374,6 @@ fn run_device(
     Ok(())
 }
 
-/// `buttons` subcommand: print the evdev name of each mouse button as you press
-/// it, so you can fill in `[[button]]` rules. Reads without grabbing, so the
-/// buttons keep working normally while you identify them.
-pub fn watch_buttons() -> i32 {
-    let mut threads = Vec::new();
-    let mut count = 0usize;
-    for (_path, dev) in evdev::enumerate() {
-        if !is_mouse_like(&dev) {
-            continue;
-        }
-        let name = dev.name().unwrap_or("mouse").to_string();
-        count += 1;
-        let mut dev = dev;
-        threads.push(thread::spawn(move || {
-            while let Ok(evs) = dev.fetch_events() {
-                for ev in evs {
-                    if ev.event_type() == EventType::KEY && ev.value() == 1 {
-                        println!("{name}: {:?}  (code {})", Key(ev.code()), ev.code());
-                    }
-                }
-            }
-        }));
-    }
-    if count == 0 {
-        eprintln!("no mouse-like devices found — are you root?  (sudo wayland-mouse buttons)");
-        return 1;
-    }
-    eprintln!("watching {count} device(s) — press your mouse buttons (Ctrl-C to stop)");
-    for t in threads {
-        let _ = t.join();
-    }
-    0
-}
-
-fn is_mouse_like(dev: &Device) -> bool {
-    let name = dev.name().unwrap_or("");
-    if name.contains(VIRT_PREFIX) {
-        return false;
-    }
-    // BTN_MOUSE..=BTN_TASK (0x110..=0x117) covers the usual mouse buttons.
-    let has_btn = dev
-        .supported_keys()
-        .is_some_and(|k| (0x110..=0x117).any(|c| k.contains(Key(c))));
-    let has_wheel = dev
-        .supported_relative_axes()
-        .is_some_and(|s| s.contains(RelativeAxisType::REL_WHEEL) || s.contains(REL_WHEEL_HI));
-    has_btn || has_wheel
+fn emit_left_release(vdev: &mut VirtualDevice) -> io::Result<()> {
+    vdev.emit(&[InputEvent::new(EventType::KEY.0, Key::BTN_LEFT.code(), 0)])
 }

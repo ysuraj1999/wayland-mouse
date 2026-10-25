@@ -6,6 +6,7 @@
 //! runtime struct keeps the original mathematical field names. One serde type
 //! tree is the single source of truth a future GUI can round-trip.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -58,8 +59,18 @@ pub struct Settings {
     pub ptr_tau: f64,
     pub dpi: f64,
 
+    // temporary click lock (tap-to-drag), per device
+    pub click_lock: bool,
+    pub click_lock_hold: Duration,
+    pub click_lock_release: Duration,
+
     pub debug: bool,
 }
+
+/// Defaults for the per-device click lock. Disabled unless a device rule turns
+/// it on; the timings match the original `tapdrag` defaults.
+pub const CLICK_LOCK_HOLD: Duration = Duration::from_millis(180);
+pub const CLICK_LOCK_RELEASE: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
 // Presets — concrete curve sets, expressed at REFERENCE_DPI
@@ -93,6 +104,10 @@ fn mac_like() -> Settings {
         ptr_tau: 0.006,
         dpi: REFERENCE_DPI,
 
+        click_lock: false,
+        click_lock_hold: CLICK_LOCK_HOLD,
+        click_lock_release: CLICK_LOCK_RELEASE,
+
         debug: false,
     }
 }
@@ -121,6 +136,10 @@ fn subtle() -> Settings {
         ptr_tau: 0.012,
         dpi: REFERENCE_DPI,
 
+        click_lock: false,
+        click_lock_hold: CLICK_LOCK_HOLD,
+        click_lock_release: CLICK_LOCK_RELEASE,
+
         debug: false,
     }
 }
@@ -148,25 +167,22 @@ fn off() -> Settings {
         ptr_tau: 0.012,
         dpi: REFERENCE_DPI,
 
+        click_lock: false,
+        click_lock_hold: CLICK_LOCK_HOLD,
+        click_lock_release: CLICK_LOCK_RELEASE,
+
         debug: false,
     }
 }
 
-/// Resolve a preset by name; `None` if unknown (caller decides the fallback).
-fn preset(name: &str) -> Option<Settings> {
+/// Resolve a built-in preset by name; `None` if unknown (caller decides the fallback).
+fn builtin_preset(name: &str) -> Option<Settings> {
     match name.trim().to_lowercase().as_str() {
         "mac-like" | "mac" | "macos" | "mac_like" => Some(mac_like()),
         "subtle" | "gentle" => Some(subtle()),
         "off" | "flat" | "none" | "passthrough" => Some(off()),
         _ => None,
     }
-}
-
-/// The preset's config-space (un-rescaled) settings, falling back to mac-like.
-/// The tuner uses this to show effective values before any override is applied.
-#[cfg(feature = "tune")]
-pub fn preset_or_default(name: &str) -> Settings {
-    preset(name).unwrap_or_else(mac_like)
 }
 
 // ---------------------------------------------------------------------------
@@ -189,8 +205,10 @@ pub struct ConfigFile {
     pub pointer: PointerCfg,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub device: Vec<DeviceRule>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub button: Vec<ButtonRule>,
+    /// User-created presets. Built-in names (`mac-like`, `subtle`, `off`) stay
+    /// in code and are not stored here.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub presets: BTreeMap<String, PresetDef>,
 }
 
 impl Default for ConfigFile {
@@ -203,23 +221,80 @@ impl Default for ConfigFile {
             wheel: WheelCfg::default(),
             pointer: PointerCfg::default(),
             device: Vec::new(),
-            button: Vec::new(),
+            presets: BTreeMap::new(),
         }
     }
 }
 
-/// A button → key-combo mapping. `match` is a button name (`BTN_SIDE` or
-/// `side`); `keys` is the combo (`["Super", "Page_Up"]`); `mode` is `tap`
-/// (default, press+release on button-down) or `hold` (mirror the button).
+/// A user-created preset. Values are config-space (un-rescaled); missing fields
+/// inherit from the `mac-like` baseline. The tuner writes full snapshots.
 #[derive(Deserialize, Serialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
-pub struct ButtonRule {
-    #[serde(rename = "match")]
-    pub match_: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub keys: Vec<String>,
+pub struct PresetDef {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub dpi: Option<f64>,
+    #[serde(skip_serializing_if = "WheelCfg::is_empty")]
+    pub wheel: WheelCfg,
+    #[serde(skip_serializing_if = "PointerCfg::is_empty")]
+    pub pointer: PointerCfg,
+}
+
+impl PresetDef {
+    /// Resolve this preset into config-space settings (mac-like baseline).
+    pub fn to_settings(&self) -> Settings {
+        let mut s = mac_like();
+        apply_wheel(&mut s, &self.wheel);
+        apply_pointer(&mut s, &self.pointer);
+        s.dpi = self.dpi.unwrap_or(REFERENCE_DPI);
+        s
+    }
+
+    /// Capture a full snapshot of resolved settings.
+    #[cfg(feature = "tune")]
+    pub fn from_settings(s: &Settings) -> Self {
+        PresetDef {
+            dpi: Some(s.dpi),
+            wheel: WheelCfg {
+                enabled: Some(s.wheel_enabled),
+                start_speed: Some(s.threshold_dps),
+                strength: Some(s.accel),
+                curve: Some(s.exponent),
+                max_multiplier: Some(s.max_mult),
+                min_multiplier: Some(s.min_mult),
+                smoothing_up: Some(s.attack),
+                smoothing_down: Some(s.release),
+                reset_after_ms: Some(s.reset_gap.as_secs_f64() * 1000.0),
+                discrete_steps: Some(s.wheel_discrete_steps),
+                steps_above: Some(s.step_start),
+            },
+            pointer: PointerCfg {
+                enabled: Some(s.pointer_accel),
+                precision_gain: Some(s.ptr_base),
+                max_gain: Some(s.ptr_max),
+                midpoint_speed: Some(s.ptr_mid),
+                transition_width: Some(s.ptr_width),
+                smoothing_ms: Some(s.ptr_tau * 1000.0),
+            },
+        }
+    }
+}
+
+/// Per-device temporary click lock (tap-to-drag). Omitted everywhere by default.
+#[derive(Deserialize, Serialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ClickLockCfg {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_ms: Option<f64>,
+}
+
+impl ClickLockCfg {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.hold_ms.is_none() && self.release_ms.is_none()
+    }
 }
 
 #[derive(Deserialize, Serialize, Default, Clone, Debug, PartialEq)]
@@ -250,7 +325,7 @@ pub struct WheelCfg {
 }
 
 impl WheelCfg {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.start_speed.is_none()
             && self.strength.is_none()
@@ -283,7 +358,7 @@ pub struct PointerCfg {
 }
 
 impl PointerCfg {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.precision_gain.is_none()
             && self.max_gain.is_none()
@@ -307,6 +382,8 @@ pub struct DeviceRule {
     pub wheel: WheelCfg,
     #[serde(skip_serializing_if = "PointerCfg::is_empty")]
     pub pointer: PointerCfg,
+    #[serde(skip_serializing_if = "ClickLockCfg::is_empty")]
+    pub click_lock: ClickLockCfg,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -318,24 +395,58 @@ fn is_false(b: &bool) -> bool {
 // ---------------------------------------------------------------------------
 
 impl ConfigFile {
-    /// First device rule whose `match` substring is in `device_name`.
-    fn rule_for<'a>(&'a self, device_name: &str) -> Option<&'a DeviceRule> {
+    /// Index of the first device rule whose `match` substring is in the name.
+    pub fn rule_index(&self, device_name: &str) -> Option<usize> {
         let lname = device_name.to_lowercase();
         self.device
             .iter()
-            .find(|d| !d.match_.is_empty() && lname.contains(&d.match_.to_lowercase()))
+            .position(|d| !d.match_.is_empty() && lname.contains(&d.match_.to_lowercase()))
     }
 
-    /// Resolve the effective [`Settings`] for a device by name.
-    ///
-    /// Layering: base preset (device rule's preset if set, else the global
-    /// preset) → global overrides → device overrides → DPI rescale.
-    pub fn resolve(&self, device_name: &str) -> Settings {
+    /// First device rule whose `match` substring is in `device_name`.
+    pub fn rule_for(&self, device_name: &str) -> Option<&DeviceRule> {
+        self.rule_index(device_name).map(|i| &self.device[i])
+    }
+
+    /// Names shown by the tuner: built-ins first, then custom profiles.
+    pub fn preset_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = PRESET_NAMES.iter().map(|s| (*s).to_string()).collect();
+        names.extend(self.presets.keys().cloned());
+        names
+    }
+
+    /// Whether `name` resolves to a built-in or a custom preset.
+    pub fn has_preset(&self, name: &str) -> bool {
+        self.presets.contains_key(name) || builtin_preset(name).is_some()
+    }
+
+    /// True when `name` is one of the hard-coded presets.
+    pub fn is_builtin_preset(name: &str) -> bool {
+        builtin_preset(name).is_some()
+    }
+
+    /// Resolve a preset by name (custom first, then built-ins).
+    pub fn preset_settings(&self, name: &str) -> Option<Settings> {
+        if let Some(p) = self.presets.get(name) {
+            return Some(p.to_settings());
+        }
+        builtin_preset(name)
+    }
+
+    /// Whether any device rule explicitly enables click lock for this name.
+    pub fn click_lock_for(&self, device_name: &str) -> bool {
+        self.rule_for(device_name)
+            .and_then(|r| r.click_lock.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Resolve config-space settings (no DPI rescale) for a device.
+    pub fn resolve_config_space(&self, device_name: &str) -> Settings {
         let rule = self.rule_for(device_name);
         let preset_name = rule
             .and_then(|r| r.preset.as_deref())
             .unwrap_or(&self.preset);
-        let mut s = preset(preset_name).unwrap_or_else(|| {
+        let mut s = self.preset_settings(preset_name).unwrap_or_else(|| {
             eprintln!("wayland-mouse: unknown preset {preset_name:?}, using 'mac-like'");
             mac_like()
         });
@@ -345,13 +456,20 @@ impl ConfigFile {
         if let Some(r) = rule {
             apply_wheel(&mut s, &r.wheel);
             apply_pointer(&mut s, &r.pointer);
+            apply_click_lock(&mut s, &r.click_lock);
         }
 
-        s.dpi = rule
-            .and_then(|r| r.dpi)
-            .or(self.dpi)
-            .unwrap_or(REFERENCE_DPI);
+        s.dpi = rule.and_then(|r| r.dpi).or(self.dpi).unwrap_or(s.dpi);
         s.debug = self.debug;
+        s
+    }
+
+    /// Resolve the effective [`Settings`] for a device by name.
+    ///
+    /// Layering: base preset (device rule's preset if set, else the global
+    /// preset) → global overrides → device overrides → DPI rescale.
+    pub fn resolve(&self, device_name: &str) -> Settings {
+        let mut s = self.resolve_config_space(device_name);
         rescale(&mut s);
         s
     }
@@ -359,18 +477,6 @@ impl ConfigFile {
     /// Effective settings with no device rule applied (the global baseline).
     pub fn resolve_global(&self) -> Settings {
         self.resolve("")
-    }
-
-    /// Config-space (un-rescaled) global settings: preset + global overrides,
-    /// before DPI rescale. This is what the tuner edits and plots — the values
-    /// as they appear in the file, independent of DPI.
-    #[cfg(feature = "tune")]
-    pub fn resolve_unscaled(&self) -> Settings {
-        let mut s = preset_or_default(&self.preset);
-        apply_wheel(&mut s, &self.wheel);
-        apply_pointer(&mut s, &self.pointer);
-        s.dpi = self.dpi.unwrap_or(REFERENCE_DPI);
-        s
     }
 }
 
@@ -407,6 +513,18 @@ fn apply_wheel(s: &mut Settings, w: &WheelCfg) {
     }
     if let Some(v) = w.steps_above {
         s.step_start = v;
+    }
+}
+
+fn apply_click_lock(s: &mut Settings, c: &ClickLockCfg) {
+    if let Some(v) = c.enabled {
+        s.click_lock = v;
+    }
+    if let Some(v) = c.hold_ms {
+        s.click_lock_hold = Duration::from_secs_f64((v / 1000.0).max(0.0));
+    }
+    if let Some(v) = c.release_ms {
+        s.click_lock_release = Duration::from_secs_f64((v / 1000.0).max(0.0));
     }
 }
 
@@ -479,22 +597,27 @@ pub fn print_effective(path: &Path) -> i32 {
             path.display()
         );
     }
-    print_settings("global", &cf.resolve_global());
+    print_settings(
+        &format!("global preset={:?}", cf.preset),
+        &cf.resolve_global(),
+    );
     for r in &cf.device {
         if r.match_.is_empty() {
             continue;
         }
         println!();
+        let preset = r.preset.as_deref().unwrap_or(&cf.preset);
         print_settings(
-            &format!("device matching {:?}", r.match_),
+            &format!("device matching {:?} preset={preset:?}", r.match_),
             &cf.resolve(&r.match_),
         );
     }
-    if !cf.button.is_empty() {
-        println!("\n[buttons]");
-        for b in &cf.button {
-            let mode = b.mode.as_deref().unwrap_or("tap");
-            println!("  {} -> {}  ({mode})", b.match_, b.keys.join(" + "));
+    if !cf.presets.is_empty() {
+        println!("\n[presets]");
+        for name in cf.presets.keys() {
+            if let Some(s) = cf.preset_settings(name) {
+                print_settings(name, &s);
+            }
         }
     }
     0
@@ -520,13 +643,19 @@ fn print_settings(label: &str, s: &Settings) {
     );
     println!(
         "  pointer: enabled={} precision_gain={:.3} max_gain={:.3} midpoint_speed={:.0} \
-         transition_width={:.0} smoothing_ms={:.1}  (values shown after DPI rescale)",
+         transition_width={:.0} smoothing_ms={:.1}  (global/device values include DPI rescale)",
         s.pointer_accel,
         s.ptr_base,
         s.ptr_max,
         s.ptr_mid,
         s.ptr_width,
         s.ptr_tau * 1000.0,
+    );
+    println!(
+        "  click_lock: enabled={} hold_ms={:.0} release_ms={:.0}",
+        s.click_lock,
+        s.click_lock_hold.as_secs_f64() * 1000.0,
+        s.click_lock_release.as_secs_f64() * 1000.0,
     );
 }
 
@@ -580,9 +709,8 @@ pub fn check(path: &Path) -> i32 {
         "wheel",
         "pointer",
         "device",
-        "button",
+        "presets",
     ];
-    const BUTTON: &[&str] = &["match", "keys", "mode"];
     const WHEEL: &[&str] = &[
         "enabled",
         "start_speed",
@@ -604,7 +732,9 @@ pub fn check(path: &Path) -> i32 {
         "transition_width",
         "smoothing_ms",
     ];
-    const DEVICE: &[&str] = &["match", "preset", "dpi", "wheel", "pointer"];
+    const DEVICE: &[&str] = &["match", "preset", "dpi", "wheel", "pointer", "click_lock"];
+    const PRESET: &[&str] = &["dpi", "wheel", "pointer"];
+    const CLICK_LOCK: &[&str] = &["enabled", "hold_ms", "release_ms"];
 
     if let Some(t) = value.as_table() {
         unknowns(t, TOP, "", &mut warn);
@@ -624,39 +754,85 @@ pub fn check(path: &Path) -> i32 {
                     if let Some(p) = dt.get("pointer").and_then(|v| v.as_table()) {
                         unknowns(p, POINTER, &format!("device[{i}].pointer."), &mut warn);
                     }
+                    if let Some(c) = dt.get("click_lock").and_then(|v| v.as_table()) {
+                        unknowns(
+                            c,
+                            CLICK_LOCK,
+                            &format!("device[{i}].click_lock."),
+                            &mut warn,
+                        );
+                    }
                 }
             }
         }
-        if let Some(arr) = t.get("button").and_then(|v| v.as_array()) {
-            for (i, b) in arr.iter().enumerate() {
-                if let Some(bt) = b.as_table() {
-                    unknowns(bt, BUTTON, &format!("button[{i}]."), &mut warn);
+        if let Some(pt) = t.get("presets").and_then(|v| v.as_table()) {
+            for (name, pv) in pt {
+                if let Some(p) = pv.as_table() {
+                    unknowns(p, PRESET, &format!("presets.{name}."), &mut warn);
+                    if let Some(w) = p.get("wheel").and_then(|v| v.as_table()) {
+                        unknowns(w, WHEEL, &format!("presets.{name}.wheel."), &mut warn);
+                    }
+                    if let Some(ptr) = p.get("pointer").and_then(|v| v.as_table()) {
+                        unknowns(ptr, POINTER, &format!("presets.{name}.pointer."), &mut warn);
+                    }
                 }
             }
+        }
+        if t.get("button").is_some() {
+            warn("[[button]] remapping was removed and is ignored".into());
         }
     }
 
     // 3. Preset names.
-    if preset(&cf.preset).is_none() {
+    if !cf.has_preset(&cf.preset) {
         warn(format!(
             "preset {:?} is unknown (valid: {})",
             cf.preset,
-            PRESET_NAMES.join(", ")
+            cf.preset_names().join(", ")
         ));
     }
     for r in &cf.device {
         if let Some(p) = &r.preset {
-            if preset(p).is_none() {
+            if !cf.has_preset(p) {
                 warn(format!("device {:?}: preset {:?} is unknown", r.match_, p));
             }
+        }
+    }
+    for name in cf.presets.keys() {
+        if ConfigFile::is_builtin_preset(name) {
+            warn(format!(
+                "presets.{name} shadows a built-in preset; rename it"
+            ));
         }
     }
 
     // 4. Value ranges (on the resolved global settings).
     validate_ranges(&cf.resolve_global(), &mut warn);
-
-    // 5. Button rules.
-    crate::remap::validate_buttons(&cf.button, &mut warn);
+    for name in cf.presets.keys() {
+        if let Some(p) = cf.preset_settings(name) {
+            let mut w = |msg: String| warn(format!("presets.{name}: {msg}"));
+            validate_ranges(&p, &mut w);
+        }
+    }
+    for (i, r) in cf.device.iter().enumerate() {
+        if let Some(v) = r.click_lock.hold_ms {
+            if v <= 0.0 {
+                warn(format!("device[{i}].click_lock.hold_ms should be > 0"));
+            }
+        }
+        if let Some(v) = r.click_lock.release_ms {
+            if v <= 0.0 {
+                warn(format!("device[{i}].click_lock.release_ms should be > 0"));
+            }
+        }
+        if r.click_lock.enabled != Some(true)
+            && (r.click_lock.hold_ms.is_some() || r.click_lock.release_ms.is_some())
+        {
+            warn(format!(
+                "device[{i}].click_lock timings are ignored until enabled = true"
+            ));
+        }
+    }
 
     if warnings == 0 {
         println!("✓ {} is valid", path.display());
@@ -827,14 +1003,51 @@ mod tests {
     }
 
     #[test]
-    fn button_rules_parse_from_toml() {
+    fn custom_preset_resolves_and_round_trips() {
         let cf: ConfigFile = toml::from_str(
-            "preset = \"mac-like\"\n\
-             [[button]]\nmatch = \"BTN_SIDE\"\nkeys = [\"Super\", \"Page_Up\"]\n",
+            "preset = \"mine\"\n\
+             [presets.mine]\ndpi = 1600\n\
+             [presets.mine.pointer]\nmax_gain = 4.0\n\
+             [[device]]\nmatch = \"Acer\"\npreset = \"mine\"\n",
         )
         .unwrap();
-        assert_eq!(cf.button.len(), 1);
-        assert_eq!(cf.button[0].match_, "BTN_SIDE"); // #[serde(rename = "match")]
-        assert_eq!(cf.button[0].keys, vec!["Super", "Page_Up"]);
+        assert!(cf.has_preset("mine"));
+        assert!(cf.preset_names().iter().any(|n| n == "mine"));
+        let s = cf.resolve_config_space("Acer BT Keyboard1 Mouse");
+        assert!(approx(s.ptr_max, 4.0));
+        assert!(approx(s.ptr_base, 0.5)); // inherited from mac-like
+        assert!(approx(s.dpi, 1600.0));
+
+        let text = toml::to_string_pretty(&cf).unwrap();
+        let back: ConfigFile = toml::from_str(&text).unwrap();
+        assert_eq!(back.presets.len(), 1);
+    }
+
+    #[test]
+    fn per_device_click_lock_layers() {
+        let cf: ConfigFile = toml::from_str(
+            "[[device]]\nmatch = \"Acer\"\n\
+             [device.click_lock]\nenabled = true\nhold_ms = 200\nrelease_ms = 450\n",
+        )
+        .unwrap();
+        let s = cf.resolve("Acer BT Keyboard1 Mouse");
+        assert!(s.click_lock);
+        assert_eq!(s.click_lock_hold, Duration::from_millis(200));
+        assert_eq!(s.click_lock_release, Duration::from_millis(450));
+        let other = cf.resolve("Other Mouse");
+        assert!(!other.click_lock);
+        assert_eq!(other.click_lock_hold, CLICK_LOCK_HOLD);
+        assert!(cf.click_lock_for("Acer BT Keyboard1 Mouse"));
+        assert!(!cf.click_lock_for("Other Mouse"));
+    }
+
+    #[test]
+    fn legacy_button_table_is_ignored() {
+        let cf: ConfigFile = toml::from_str(
+            "preset = \"mac-like\"\n\
+             [[button]]\nmatch = \"BTN_SIDE\"\nkeys = [\"Super\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cf.preset, "mac-like");
     }
 }

@@ -18,8 +18,9 @@ preset = "mac-like"
 # same across mice and resolutions. Just set this to match your hardware.
 dpi = 1400
 
-# Only accelerate devices whose name contains this (case-insensitive).
-# Empty = every mouse with a wheel.  Example:  name_filter = "Logitech"
+# Only manage devices whose name contains this (case-insensitive).
+# Empty = every wheel mouse (plus pointer devices with an explicit device rule
+# or click lock).  Example:  name_filter = "Logitech"
 name_filter = ""
 
 # =====================================================================
@@ -67,37 +68,33 @@ transition_width = 2000   # width of the transition; larger = gentler S
 smoothing_ms     = 6      # speed smoothing time constant; lower = twitchier/snappier
 
 # =====================================================================
-# Per-device overrides (optional). The first rule whose `match` substring is in
-# the device name wins; it layers on top of the global settings above. Each rule
-# may set its own preset, dpi, and [device.wheel] / [device.pointer] overrides.
+# Custom profiles (optional). `preset = "name"` above or on a device rule can
+# refer to any of these. Built-ins stay in the binary: mac-like, subtle, off.
+# The tuner writes full snapshots here when you create/update a profile.
 # =====================================================================
-# [[device]]
-# match = "Logitech"
-# dpi   = 1600
-# preset = "subtle"
-#
-# [[device]]
-# match = "Trackball"
-# [device.pointer]
-# enabled = false
+# [presets.my-trackpad]
+# dpi = 1400
+# [presets.my-trackpad.wheel]
+# enabled = true
+# start_speed = 3
+# strength = 0.06
+# [presets.my-trackpad.pointer]
+# enabled = true
+# max_gain = 3.0
 
 # =====================================================================
-# Button remapping (optional). Map a mouse button to a key combo, sent on a
-# virtual keyboard so your compositor handles it like any global shortcut.
-#   match : button name — BTN_SIDE / BTN_EXTRA / BTN_FORWARD / BTN_BACK
-#           (or the short forms side / extra / forward / back / middle).
-#           Not sure which is which? Run:  sudo wayland-mouse buttons
-#   keys  : the combo, e.g. ["Super", "Page_Up"]. Friendly names (Super, Ctrl,
-#           Alt, Shift, Page_Up, arrows, Enter, …) or raw evdev names (KEY_F5).
-#   mode  : "tap" (default) presses + releases on button-down — right for
-#           discrete actions; "hold" holds the keys while the button is held.
-#
-# Example: side buttons switch GNOME workspaces (default Super+Page_Up/Down).
+# Per-device rules (optional). The first rule whose `match` substring is in
+# the device name wins. `preset` binds the device to a built-in or custom
+# profile; the tuner creates these for you when you press `a`.
 # =====================================================================
-# [[button]]
-# match = "BTN_SIDE"
-# keys  = ["Super", "Page_Up"]
+# [[device]]
+# match = "Acer BT Keyboard1 Mouse"
+# preset = "my-trackpad"
 #
-# [[button]]
-# match = "BTN_EXTRA"
-# keys  = ["Super", "Page_Down"]
+# Temporary click lock (tap-to-drag), per device. Hold the left button for
+# hold_ms, then release: the button stays held. Every pointer movement pushes
+# the release timer out by release_ms; pressing again while locked renews it.
+# [device.click_lock]
+# enabled = true
+# hold_ms = 180
+# release_ms = 300

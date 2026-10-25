@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -15,7 +15,6 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ConfigFile;
-use crate::remap::{build_table, RemapTable, VirtualKeyboard};
 
 /// Where the control socket lives. Root-owned (the daemon is a system service),
 /// so `tune` connects as root too.
@@ -29,9 +28,6 @@ pub struct Telemetry {
     pointer_gain: AtomicU64,
     wheel_dps: AtomicU64,
     wheel_mult: AtomicU64,
-    /// evdev code of the most recently pressed button (0 = none/cleared). Used
-    /// by the tuner's "press the button to map" capture flow.
-    last_button: AtomicU32,
 }
 
 impl Telemetry {
@@ -43,9 +39,6 @@ impl Telemetry {
         self.wheel_dps.store(dps.to_bits(), Ordering::Relaxed);
         self.wheel_mult.store(mult.to_bits(), Ordering::Relaxed);
     }
-    pub fn set_button(&self, code: u16) {
-        self.last_button.store(code as u32, Ordering::Relaxed);
-    }
     fn snapshot(&self) -> TelemetrySample {
         let load = |a: &AtomicU64| f64::from_bits(a.load(Ordering::Relaxed));
         TelemetrySample {
@@ -53,9 +46,19 @@ impl Telemetry {
             pointer_gain: load(&self.pointer_gain),
             wheel_dps: load(&self.wheel_dps),
             wheel_mult: load(&self.wheel_mult),
-            last_button: self.last_button.load(Ordering::Relaxed),
         }
     }
+}
+
+/// One physical pointer-like device discovered by the daemon.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub path: String,
+    pub grabbed: bool,
+    pub has_wheel: bool,
+    pub has_pointer: bool,
+    pub has_left: bool,
 }
 
 /// State shared between the input threads and the control socket.
@@ -64,23 +67,17 @@ pub struct Shared {
     version: AtomicU64,
     pub telemetry: Telemetry,
     config_path: PathBuf,
-    /// Button → action map, rebuilt live on every config change.
-    remap: ArcSwap<RemapTable>,
-    /// The shared virtual keyboard (created once by the daemon; `None` if it
-    /// couldn't be created, e.g. no uinput access).
-    keyboard: Mutex<Option<Arc<VirtualKeyboard>>>,
+    devices: Mutex<Vec<DeviceInfo>>,
 }
 
 impl Shared {
     pub fn new(cfg: ConfigFile, config_path: PathBuf) -> Arc<Self> {
-        let remap = ArcSwap::from_pointee(build_table(&cfg.button));
         Arc::new(Shared {
             cfg: ArcSwap::from_pointee(cfg),
             version: AtomicU64::new(0),
             telemetry: Telemetry::default(),
             config_path,
-            remap,
-            keyboard: Mutex::new(None),
+            devices: Mutex::new(Vec::new()),
         })
     }
 
@@ -95,34 +92,21 @@ impl Shared {
         self.version.load(Ordering::Relaxed)
     }
 
-    /// Replace the live config, rebuild the remap table, and bump the version.
+    /// Replace the live config and bump the version.
     pub fn replace(&self, cfg: ConfigFile) {
-        self.remap.store(Arc::new(build_table(&cfg.button)));
         self.cfg.store(Arc::new(cfg));
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The current button remap table (cheap atomic load).
-    pub fn remap(&self) -> Arc<RemapTable> {
-        self.remap.load_full()
+    /// Snapshot of pointer-like devices seen by the last daemon scan.
+    pub fn devices(&self) -> Vec<DeviceInfo> {
+        self.devices.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
-    /// The shared virtual keyboard, created on first use. We only ever create
-    /// it when a button remap actually needs it, so users who don't remap any
-    /// buttons get no extra uinput device. Returns `None` only if the device
-    /// couldn't be created (e.g. no uinput access).
-    pub fn ensure_keyboard(&self) -> Option<Arc<VirtualKeyboard>> {
-        let mut guard = self.keyboard.lock().unwrap();
-        if guard.is_none() {
-            match VirtualKeyboard::new_full() {
-                Ok(kb) => *guard = Some(Arc::new(kb)),
-                Err(e) => {
-                    eprintln!("wayland-mouse: could not create virtual keyboard ({e}); button remap skipped");
-                    return None;
-                }
-            }
+    pub fn set_devices(&self, devices: Vec<DeviceInfo>) {
+        if let Ok(mut d) = self.devices.lock() {
+            *d = devices;
         }
-        guard.clone()
     }
 
     /// Persist the current live config to disk as TOML.
@@ -145,13 +129,10 @@ impl Shared {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     GetConfig,
-    SetConfig {
-        config: Box<ConfigFile>,
-    },
+    SetConfig { config: Box<ConfigFile> },
     Save,
     GetTelemetry,
-    /// Clear `last_button` so the next press is recognised as a fresh capture.
-    ArmCapture,
+    ListDevices,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,6 +140,7 @@ pub enum Request {
 pub enum Response {
     Config { config: Box<ConfigFile> },
     Telemetry(TelemetrySample),
+    Devices { devices: Vec<DeviceInfo> },
     Ok,
     Error { message: String },
 }
@@ -169,7 +151,6 @@ pub struct TelemetrySample {
     pub pointer_gain: f64,
     pub wheel_dps: f64,
     pub wheel_mult: f64,
-    pub last_button: u32,
 }
 
 /// Spawn the control-socket server. Best-effort: a failure here just means live
@@ -233,10 +214,9 @@ fn process(req: Request, shared: &Shared) -> Response {
             Err(message) => Response::Error { message },
         },
         Request::GetTelemetry => Response::Telemetry(shared.telemetry.snapshot()),
-        Request::ArmCapture => {
-            shared.telemetry.set_button(0);
-            Response::Ok
-        }
+        Request::ListDevices => Response::Devices {
+            devices: shared.devices(),
+        },
     }
 }
 
@@ -328,29 +308,24 @@ mod tests {
     }
 
     #[test]
-    fn set_config_rebuilds_remap_live() {
-        let s = shared(); // no button rules initially
-        let side = evdev::KeyCode::BTN_SIDE.code();
-        assert!(s.remap().get(side).is_none());
-        let cf = ConfigFile {
-            button: vec![crate::config::ButtonRule {
-                match_: "BTN_SIDE".into(),
-                keys: vec!["Super".into(), "Page_Up".into()],
-                mode: None,
-            }],
-            ..Default::default()
-        };
-        assert!(matches!(
-            process(
-                Request::SetConfig {
-                    config: Box::new(cf)
-                },
-                &s
-            ),
-            Response::Ok
-        ));
-        // The remap table updated without a restart.
-        assert!(s.remap().get(side).is_some());
+    fn process_lists_devices() {
+        let s = shared();
+        s.set_devices(vec![DeviceInfo {
+            name: "Acer BT Keyboard1 Mouse".into(),
+            path: "/dev/input/event16".into(),
+            grabbed: true,
+            has_wheel: true,
+            has_pointer: true,
+            has_left: true,
+        }]);
+        match process(Request::ListDevices, &s) {
+            Response::Devices { devices } => {
+                assert_eq!(devices.len(), 1);
+                assert_eq!(devices[0].name, "Acer BT Keyboard1 Mouse");
+                assert!(devices[0].grabbed);
+            }
+            _ => panic!("expected devices"),
+        }
     }
 
     // The client (tune) and server (daemon) are split processes; this pins the
@@ -376,5 +351,7 @@ mod tests {
         // Tagged unit variants too.
         let back: Request = serde_json::from_str(r#"{"cmd":"get_config"}"#).unwrap();
         assert!(matches!(back, Request::GetConfig));
+        let back: Request = serde_json::from_str(r#"{"cmd":"list_devices"}"#).unwrap();
+        assert!(matches!(back, Request::ListDevices));
     }
 }

@@ -37,9 +37,7 @@ enum Command {
     Uninstall,
     /// Show service state and the effective config.
     Status,
-    /// Print the evdev name of each mouse button as you press it (for [[button]] config).
-    Buttons,
-    /// Live-tune the curves in a colorful terminal UI (needs the running service; root).
+    /// Live-tune profiles and device bindings in a terminal UI (root).
     #[cfg(feature = "tune")]
     Tune,
     /// Inspect the configuration.
@@ -65,7 +63,6 @@ pub fn main() {
         Some(Command::Install) => std::process::exit(install::install()),
         Some(Command::Uninstall) => std::process::exit(install::uninstall()),
         Some(Command::Status) => std::process::exit(install::status()),
-        Some(Command::Buttons) => std::process::exit(device::watch_buttons()),
         #[cfg(feature = "tune")]
         Some(Command::Tune) => std::process::exit(crate::tune::run()),
         Some(Command::Config { print: _, check }) => {
